@@ -19,6 +19,7 @@ ROBOFLOW_CONF      = float(os.getenv("ROBOFLOW_CONF", "0.5"))
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
 MODELS_DIR = os.path.join(ASSETS_DIR, "models")
+# https://github.com/CallMeCore/Playing-Cards-Object-Detection/tree/main/final_models/yolov8m_synthetic.pt
 ULTRALYTICS_WEIGHTS = os.getenv("ULTRA_WEIGHTS", os.path.join(MODELS_DIR, "playing_cards_yolov8.pt"))
 ULTRA_CONF = float(os.getenv("ULTRA_CONF", "0.25"))  # 从0.3进一步降到0.25
 

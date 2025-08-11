@@ -123,6 +123,10 @@ def main():
     last_solution_text = None
     # 替换为异步TTS
     tts = TTSWorker(rate=180)
+    # 新增：多帧聚合窗口和历史集合（基于牌(点数+花色)）
+    agg_N = 2
+    frames_cards_sets = []
+    last_seen_conf = {}  # 记录每张牌(点数+花色)最近一次的置信度
 
     while True:
         ok, frame = cap.read()
@@ -134,14 +138,20 @@ def main():
         dets = det.predict(frame)
         draw_detections(frame, dets)
 
-        # 从检测中提取牌点及置信度，并选取前4个
-        ranks_with_conf = []
+        # 从检测中提取“牌(点数+花色)”及置信度，去重取每张牌最高置信度
+        curr_cards_conf = {}  # {(rank,suit): conf}
         for d in dets:
-            r = parse_rank_from_cls_name(d["cls"])
-            if r is not None and 1 <= r <= 13:
-                ranks_with_conf.append((r, float(d["conf"])))
-        ranks_with_conf.sort(key=lambda x: x[1], reverse=True)
-        ranks = [r for r, _ in ranks_with_conf[:4]]
+            parsed = parse_card_from_cls_name(d["cls"])
+            if parsed is None:
+                continue
+            rank, suit = parsed
+            if not (1 <= rank <= 13):
+                continue
+            conf = float(d["conf"])
+            if (rank, suit) not in curr_cards_conf or conf > curr_cards_conf[(rank, suit)]:
+                curr_cards_conf[(rank, suit)] = conf
+
+        curr_cards = list(curr_cards_conf.keys())
 
         # 冷却期提示
         if now < cooldown_until:
@@ -154,16 +164,43 @@ def main():
                 # 解法用更大更清楚的字体
                 draw_chinese_text(frame, last_solution_text, (10, 140), font_size=40, color=(0, 255, 0))
         else:
-            # 非冷却期：一旦检测到4张牌，立即求解并播报，然后进入冷却
-            if len(ranks) == 4:
-                tuple_key = tuple(sorted(ranks))
+            # 非冷却期：维护最近N帧集合（以牌为单位）
+            frames_cards_sets.append(set(curr_cards))
+            while len(frames_cards_sets) > agg_N:
+                frames_cards_sets.pop(0)
 
-                solution = solve_24_prefer_simple(list(tuple_key))
+            # 更新最近置信度
+            for k, v in curr_cards_conf.items():
+                last_seen_conf[k] = v
+
+            # 显示聚合N
+            draw_chinese_text(frame, f"聚合N = {agg_N}", (10, 60), font_size=32, color=(255, 255, 0))
+
+            # 候选：优先当前帧已凑齐4张；否则用最近N帧并集去重后凑齐4张
+            candidate_cards = None
+            if len(curr_cards) >= 4:
+                # 取当前帧中按置信度最高的4张牌
+                candidate_cards = [k for k, _ in sorted(curr_cards_conf.items(), key=lambda kv: kv[1], reverse=True)[:4]]
+            else:
+                # 最近N帧并集（以牌为单位）
+                union_cards = set()
+                for sset in frames_cards_sets:
+                    union_cards |= sset
+                if len(union_cards) >= 4:
+                    # 用最近置信度排序，取前4张
+                    candidate_cards = sorted(list(union_cards), key=lambda k: last_seen_conf.get(k, 0.0), reverse=True)[:4]
+
+            if candidate_cards:
+                # 求解时只用点数，但保证是4张牌（允许相同点数不同花色）
+                ranks_for_solve = [r for (r, s) in candidate_cards]
+                solution = solve_24_prefer_simple(ranks_for_solve)
+
+                cards_label = ", ".join(format_card_key(c) for c in candidate_cards)
                 if solution:
-                    last_solution_text = f"{tuple_key} → {solution} = 24"
+                    last_solution_text = f"{cards_label} → {solution} = 24"
                     say_text = expr_to_speech(solution)
                 else:
-                    last_solution_text = f"{tuple_key} → 未找到24点解法"
+                    last_solution_text = f"{cards_label} → 未找到24点解法"
                     say_text = "没有找到二十四点的解法。"
 
                 # 异步播报（不阻塞画面）
@@ -171,10 +208,9 @@ def main():
 
                 # 进入8秒冷却
                 cooldown_until = time.time() + 8
-                last_tuple = tuple_key
-            else:
-                # 未凑齐4张时清空上次标记
-                last_tuple = None
+                last_tuple = tuple(candidate_cards)
+                # 清空历史，准备下一组
+                frames_cards_sets.clear()
 
         # 粗略 FPS - 用更大字体
         frame_count += 1
@@ -189,6 +225,11 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord('q'):
             break
+        # 调整聚合窗口大小（1..5）
+        if key == ord('+'):
+            agg_N = min(5, agg_N + 1)
+        elif key == ord('-'):
+            agg_N = max(1, agg_N - 1)
 
     cap.release()
     cv2.destroyAllWindows()
@@ -209,20 +250,24 @@ def parse_rank_from_cls_name(cls: str):
     if not cls:
         return None
     s = str(cls).strip().lower()
-    # 先找数字（支持"10"、"9h"等）
-    m = re.search(r'\b(10|[2-9]|1)\b', s)
+    
+    # 首先专门处理 "10" 的情况，避免被误解析
+    if "10" in s:
+        return 10
+    
+    # 再找其他数字（2-9，排除1避免和10冲突）
+    m = re.search(r'\b([2-9])\b', s)
     if m:
-        val = int(m.group(1))
-        # 如果是1，可能是A
-        if val == 1:
-            return 1
-        return val
+        return int(m.group(1))
+    
+    # 处理A（1）的情况
+    if re.search(r'\b1\b', s) or any(t in ACE_WORDS for t in re.split(r'[^a-z0-9]+', s)):
+        return 1
+    
     # 再查字母缩写和英文单词
     tokens = re.split(r'[^a-z0-9]+', s)
     tokens = [t for t in tokens if t]
-    joined = " ".join(tokens)
-    if any(t in ACE_WORDS for t in tokens) or joined == "1":
-        return 1
+    
     if any(t in TEN_WORDS for t in tokens) or "ten" in tokens:
         return 10
     if any(t in JACK_WORDS for t in tokens):
@@ -231,10 +276,12 @@ def parse_rank_from_cls_name(cls: str):
         return 12
     if any(t in KING_WORDS for t in tokens):
         return 13
+    
     # 英文数字
     for w, v in NUM_WORDS.items():
         if w in tokens:
             return v
+    
     # 常见52类压缩名如 "ah","qs","td" 等：首字符是 a23456789tjqk
     m2 = re.match(r'\b([a2-9tjqk])', s)
     if m2:
@@ -243,7 +290,66 @@ def parse_rank_from_cls_name(cls: str):
         if ch.isdigit():
             return int(ch)
         return mapping.get(ch, None)
+    
     return None
+
+def parse_card_from_cls_name(cls: str):
+    """
+    返回 (rank:int, suit:str) ，suit in {'h','d','c','s'}；解析失败返回 None
+    """
+    if not cls:
+        return None
+    s = str(cls).strip().lower()
+
+    # 先解析点数（复用已有的点数解析）
+    rank = parse_rank_from_cls_name(s)
+    if rank is None:
+        return None
+
+    suit = None
+    # 1) 词汇匹配
+    if "heart" in s:
+        suit = 'h'
+    elif "diamond" in s:
+        suit = 'd'
+    elif "club" in s:
+        suit = 'c'
+    elif "spade" in s:
+        suit = 's'
+
+    # 2) 压缩写法匹配，支持 "10h", "qs", "4d", "qc" 等格式
+    if suit is None:
+        # 先匹配 10 + 花色的情况
+        m = re.search(r'10([hdcs])', s)
+        if m:
+            suit = m.group(1)
+        else:
+            # 再匹配单字符 + 花色的情况
+            m = re.search(r'([atjqk2-9])([hdcs])', s)
+            if m:
+                suit = m.group(2)
+
+    # 3) 单字母花色（较弱，避免误判）
+    if suit is None:
+        tokens = re.split(r'[^a-z0-9]+', s)
+        tokens = [t for t in tokens if t]
+        for t in tokens:
+            if t in ('h', 'd', 'c', 's'):
+                suit = t
+                break
+
+    if suit is None:
+        return None
+    return (rank, suit)
+
+def format_card_key(card):
+    """
+    (rank:int, suit:str) -> 'Ah','Td','7c' 等
+    """
+    rank, suit = card
+    rmap = {1: 'A', 10: 'T', 11: 'J', 12: 'Q', 13: 'K'}
+    rstr = rmap.get(rank, str(rank))
+    return f"{rstr}{suit}"
 
 # 组合两个表达式节点
 def combine(a, b):
